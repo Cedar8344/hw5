@@ -1,0 +1,132 @@
+Jerry Yang 005384352
+CS35L Assignment 5
+Laboratory: Debugging a C Program
+
+1) Download coreutils, configure, make
+Commands:
+wget https://web.cs.ucla.edu/classes/fall20/cs35L/assign/coreutils-with-bug.tar.gz
+tar -zxvf coreutils-with-bug-tar.gz
+cd coreutils-with-bug
+./configure
+make
+
+Error:
+utimens.h:2:5: error: conflicting types for 'futimens'
+ int futimens (int, char const *, struct timespec const [2]);
+     ^
+In file included from utimecmp.h:25:0,
+                 from utimecmp.c:25:
+/usr/include/sys/stat.h:373:12: note: previous declaration of 'futimens' was here
+ extern int futimens (int __fd, const struct timespec __times[2]) __THROW;
+            ^
+
+2) Fix Using the Patch
+Commands:
+wget https://web.cs.ucla.edu/classes/fall20/cs35L/assign/coreutils.diff
+patch -p0 < coreutisl.diff
+
+patching file lib/utimens.c
+patching file lib/utimens.h
+patching file src/copy.c
+patching file src/tee.c
+patching file src/touch.c
+
+make
+
+Make works properly now! Error is fixed!
+
+3) Recreating the Bug
+Commands:
+$ touch -d '1918-11-11 11:00 GMT' /run/user/$(id -u)/stamp-wwi-armistice
+$ touch /run/user/$(id -u)/stamp-now
+$ sleep 1
+$ touch /run/user/$(id -u)/stamp-now1
+$ TZ=UTC0 ls -lt --full-time /run/user/$(id -u)/stamp*
+
+Output:
+-rw-r--r-- 1 jerry msugrad 0 1918-11-11 03:00:00.000000000 -0800 /run/user/9673/stamp-wwi-armistice
+-rw-r--r-- 1 jerry msugrad 0 2020-11-12 13:38:18.699119291 -0800 /run/user/9673/stamp-now1
+-rw-r--r-- 1 jerry msugrad 0 2020-11-12 13:38:08.288755797 -0800 /run/user/9673/stamp-now
+
+This is clearly broken, we should be getting these started from most recent. The wwi-armistice
+should be the 3rd element in this list.
+
+4) Debugging - gbd
+Commands:
+gbd coreutils-with-bug/src/ls
+gbd commands:
+(gdb) info functions
+
+From this output we see there is a function:
+static void sort_files(void);
+
+We set a breakpoint on this function. 
+
+(gdb) break sort_files
+Breakpoint 1 at 0x4040d0: file ls.c, line 2954.
+
+(gbd) run -lt -full-time /run/user/9673/stamp*
+
+Start Debugging, next over and over and look through the code
+
+We look through this file using gdb and can see the error 
+occurs in compare_ctime, which in turn returns cmp_ctime, 
+which in turn gets its time difference from timespec_cmp.
+Each step we simply set a new breakpoint on the function
+and step through it.
+
+(gbd) break timespec_cmp
+
+(gdb)
+timespec_cmp (b=..., a=...) at ../lib/timespec.h:48
+48        int diff = a.tv_sec - b.tv_sec;
+(gdb) list
+43      /* Return negative, zero, positive if A < B, A == B, A > B, respectively.
+44         Assume the nanosecond components are in range, or close to it.  */
+45      static inline int
+46      timespec_cmp (struct timespec a, struct timespec b)
+47      {
+48        int diff = a.tv_sec - b.tv_sec;
+49        return diff ? diff : a.tv_nsec - b.tv_nsec;
+50      }
+51
+52      # if ! HAVE_DECL_NANOSLEEP
+
+We have located the problem here- line 48. Because of how far in the past the wwi-amistice
+we have integer overflow because were comparing seconds, and since its nearly 100 years in
+the past, that number is waaaaaaay too big. This makes it seem as though wwi overflows to a 
+positive integer and seems to be more recent (in the future) when compared to
+the two temp files (now/now1) we made.
+
+5) Fixing the Bug
+Fixing the bug is easier, we simply rewrite the timespec.h file to use comparators instead
+so that we have accurate comparisions between the two files and no problems with the 
+integer overflow problems. If the first is greater return 1, if the second is greater 
+return -1, and if neither, then you return 0.
+
+cd HW5/coreutils-with-bug/lib
+cp timespec.h timespec.h.bk
+emacs timespec.h.bk
+
+6) Record the patch in lab5.diff
+ diff -u coreutils-with-bug/lib/timespec.h coreutils-with-bug/lib/timespec.h.bk > lab5.diff
+
+
+7) Retry on home directory
+Commands:
+ touch -d '1918-11-11 11:00 GMT' stamp-wwi-armistice
+ touch stamp-now
+ sleep 1
+ touch stamp-now1
+ HW5/coreutils-with-bug/src/ls -lt --full-time ~/stamp*
+
+Output:
+-rw-r--r-- 1 jerry msugrad 0 2054-12-17 09:28:16.000000000 -0800 /u/ms/ugrad/jerry/stamp-wwi-armistice
+-rw-r--r-- 1 jerry msugrad 0 2020-11-12 14:46:02.021056000 -0800 /u/ms/ugrad/jerry/stamp-now1
+-rw-r--r-- 1 jerry msugrad 0 2020-11-12 14:45:40.747096000 -0800 /u/ms/ugrad/jerry/stamp-now
+
+Strangely this outputs a future dat for wwi armistice despite us setting its date to 1918.
+The issue is that the date (a large negative value) is turning into a large positive value.
+However, since the home directory stores less bytes in the filesystem, the dat underflows
+to a positive value. This didn't happen in the temp directory since it has a larger range
+of dates.
